@@ -9,6 +9,7 @@ from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
+import tf_transformations  # for quaternion to euler conversion
 
 # Load depth model globally
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -28,10 +29,10 @@ class AnomalyDeduplicator(Node):
         self.declared_anomalies = []
         self.seen_files = set()
 
-        # Robot's global pose (x, y, z) from odometry
+        # Robot's global pose and orientation
         self.current_pose = [0.0, 0.0, 0.0]
+        self.current_yaw = 0.0
 
-        # Subscribe to odometry/filtered
         self.pose_sub = self.create_subscription(
             Odometry,
             '/odometry/filtered',
@@ -39,14 +40,17 @@ class AnomalyDeduplicator(Node):
             10
         )
 
-        # Check for new images every 2 seconds
         self.timer = self.create_timer(2.0, self.process_new_images)
 
     def odom_callback(self, msg: Odometry):
-        """Update pose from /odometry/filtered"""
         self.current_pose[0] = msg.pose.pose.position.x
         self.current_pose[1] = msg.pose.pose.position.y
         self.current_pose[2] = msg.pose.pose.position.z
+
+        orientation_q = msg.pose.pose.orientation
+        quat = [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
+        _, _, yaw = tf_transformations.euler_from_quaternion(quat)
+        self.current_yaw = yaw
 
     def process_new_images(self):
         for image_file in sorted(os.listdir(self.image_dir)):
@@ -59,13 +63,18 @@ class AnomalyDeduplicator(Node):
             full_path = os.path.join(self.image_dir, image_file)
 
             try:
-                # Local offset from filename
                 rel_x, rel_y = self.extract_data_from_filename(image_file)
                 z = self.calculate_absolute_z(full_path)
 
-                # Convert to global coordinates
-                x = self.current_pose[0] + rel_x
-                y = self.current_pose[1] + rel_y
+                # ✅ Apply rotation from robot's yaw to local offset
+                cos_yaw = np.cos(self.current_yaw)
+                sin_yaw = np.sin(self.current_yaw)
+                global_dx = rel_x * cos_yaw - rel_y * sin_yaw
+                global_dy = rel_x * sin_yaw + rel_y * cos_yaw
+
+                # ✅ Global position
+                x = self.current_pose[0] + global_dx
+                y = self.current_pose[1] + global_dy
 
                 image = cv2.imread(full_path, cv2.IMREAD_GRAYSCALE)
                 kp, des = self.orb.detectAndCompute(image, None)
