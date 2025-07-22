@@ -34,7 +34,7 @@ class AnomalyDeduplicator(Node):
         # Subscribe to SLAM pose topic
         self.pose_sub = self.create_subscription(
             PoseStamped,           # Change to PoseWithCovarianceStamped if needed
-            '/slam/pose',          # ✅ SET THIS to your actual SLAM topic
+            '/pose',          # ✅ SET THIS to your actual SLAM topic
             self.pose_callback,
             10
         )
