@@ -8,29 +8,45 @@ from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
 import rclpy
 from rclpy.node import Node
+from geometry_msgs.msg import PoseStamped  # SLAM pose message type
 
 # Load depth model globally
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 processor = AutoImageProcessor.from_pretrained("LiheYoung/depth-anything-small-hf")
 model = AutoModelForDepthEstimation.from_pretrained("LiheYoung/depth-anything-small-hf").to(device)
-SCALE = 1.0  # Change later after calibration
+SCALE = 1.0  # Calibration-dependent
 
 class AnomalyDeduplicator(Node):
     def __init__(self):
         super().__init__('anomaly_deduplicator')
-        self.image_dir = '/path/to/anomaly/images'  # SET THIS
+        self.image_dir = '/path/to/anomaly/images'  # ✅ SET THIS
         self.output_dir = 'deduplicated_anomalies'
         os.makedirs(self.output_dir, exist_ok=True)
+
         self.orb = cv2.ORB_create(500)
         self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
         self.declared_anomalies = []
         self.seen_files = set()
 
-        # Simulate pose (x, y, z) from SLAM
-        self.current_pose = [0.0, 0.0, 1.2]  # Placeholder z
+        # Global pose from SLAM
+        self.current_pose = [0.0, 0.0, 0.0]  # x, y, z
 
-        # Timer to check every 2 seconds
+        # Subscribe to SLAM pose topic
+        self.pose_sub = self.create_subscription(
+            PoseStamped,           # Change to PoseWithCovarianceStamped if needed
+            '/slam/pose',          # ✅ SET THIS to your actual SLAM topic
+            self.pose_callback,
+            10
+        )
+
+        # Check for new images every 2 seconds
         self.timer = self.create_timer(2.0, self.process_new_images)
+
+    def pose_callback(self, msg):
+        """Update robot's global pose from SLAM"""
+        self.current_pose[0] = msg.pose.position.x
+        self.current_pose[1] = msg.pose.position.y
+        self.current_pose[2] = msg.pose.position.z  # Often 0 for ground robot
 
     def process_new_images(self):
         for image_file in sorted(os.listdir(self.image_dir)):
@@ -43,8 +59,13 @@ class AnomalyDeduplicator(Node):
             full_path = os.path.join(self.image_dir, image_file)
 
             try:
-                x, y = self.extract_data_from_filename(image_file)
+                # Local coordinates from filename
+                rel_x, rel_y = self.extract_data_from_filename(image_file)
                 z = self.calculate_absolute_z(full_path)
+
+                # Convert to global using SLAM pose
+                x = self.current_pose[0] + rel_x
+                y = self.current_pose[1] + rel_y
 
                 image = cv2.imread(full_path, cv2.IMREAD_GRAYSCALE)
                 kp, des = self.orb.detectAndCompute(image, None)
