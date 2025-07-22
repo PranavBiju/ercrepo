@@ -1,46 +1,52 @@
+import os
+import numpy as np
+import cv2
+import torch
+from PIL import Image as PILImage
+from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
-from nav_msgs.msg import Odometry
-import cv2
-from cv_bridge import CvBridge
-import torch
-import numpy as np
-from PIL import Image as PILImage
-import os
-from transformers import AutoProcessor, AutoModelForDepthEstimation
 
-# Setup
+# Load depth model globally
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-processor = AutoProcessor.from_pretrained("LiheYoung/Depth-Anything-v2-small")
-model = AutoModelForDepthEstimation.from_pretrained("LiheYoung/Depth-Anything-v2-small").to(device).eval()
+processor = AutoImageProcessor.from_pretrained("LiheYoung/depth-anything-small-hf")
+model = AutoModelForDepthEstimation.from_pretrained("LiheYoung/depth-anything-small-hf").to(device)
+SCALE = 1.0  # Change later after calibration
 
-# Parameters
-DUPLICATE_DISTANCE_THRESHOLD = 0.5  # meters
-DUPLICATE_VISUAL_THRESHOLD = 0.8    # cosine similarity score
-SCALE = 1.0  # camera-dependent scaling factor (tune this)
-
-class HybridAnomalyDeduplicator(Node):
+class AnomalyDeduplicator(Node):
     def __init__(self):
-        super().__init__('hybrid_anomaly_deduplicator')
-        self.bridge = CvBridge()
-        self.image_dir = '/path/to/anomaly/images'  # Set this
-        self.declared_anomalies = []  # [(filename, x, y, z, descriptor)]
+        super().__init__('anomaly_deduplicator')
+        self.image_dir = '/path/to/anomaly/images'  # SET THIS
         self.orb = cv2.ORB_create(500)
-        self.current_pose = (0.0, 0.0, 0.0)
+        self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        self.declared_anomalies = []
+        
+        # Simulate pose (x, y, z) from SLAM
+        self.current_pose = [0.0, 0.0, 1.2]  # Placeholder z: height of camera from ground
+        
+        self.process_all_images()
 
-        # SLAM Odometry subscriber
-        self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
+    def process_all_images(self):
+        for image_file in sorted(os.listdir(self.image_dir)):
+            if not image_file.endswith(('.png', '.jpg', '.jpeg')):
+                continue
+            full_path = os.path.join(self.image_dir, image_file)
 
-        self.get_logger().info("Hybrid Deduplicator Node Started")
-        self.process_directory(self.image_dir)
+            x, y = self.extract_data_from_filename(image_file)
+            z = self.calculate_absolute_z(full_path)
 
-    def odom_callback(self, msg):
-        self.current_pose = (
-            msg.pose.pose.position.x,
-            msg.pose.pose.position.y,
-            msg.pose.pose.position.z
-        )
+            image = cv2.imread(full_path, cv2.IMREAD_GRAYSCALE)
+            kp, des = self.orb.detectAndCompute(image, None)
+
+            if self.is_duplicate(des, x, y, z):
+                self.get_logger().info(f"Duplicate anomaly at ({x:.2f}, {y:.2f}, {z:.2f})")
+                continue
+
+            self.declared_anomalies.append({
+                'x': x, 'y': y, 'z': z, 'des': des
+            })
+            self.get_logger().info(f"New anomaly detected at ({x:.2f}, {y:.2f}, {z:.2f})")
 
     def extract_data_from_filename(self, filename):
         base = os.path.basename(filename)
@@ -67,48 +73,23 @@ class HybridAnomalyDeduplicator(Node):
         absolute_z = self.current_pose[2] + relative_z
         return absolute_z
 
-    def compute_visual_descriptor(self, image_path):
-        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            return None
-        kp, des = self.orb.detectAndCompute(img, None)
-        return des
+    def is_duplicate(self, new_des, x, y, z, pos_threshold=0.3, match_threshold=30):
+        for anomaly in self.declared_anomalies:
+            dx = anomaly['x'] - x
+            dy = anomaly['y'] - y
+            dz = anomaly['z'] - z
+            dist = np.sqrt(dx**2 + dy**2 + dz**2)
 
-    def is_duplicate(self, x, y, z, descriptor):
-        for _, sx, sy, sz, sdesc in self.declared_anomalies:
-            dist = np.sqrt((x - sx)**2 + (y - sy)**2 + (z - sz)**2)
-            if dist < DUPLICATE_DISTANCE_THRESHOLD:
-                if sdesc is not None and descriptor is not None:
-                    sim = self.feature_similarity(descriptor, sdesc)
-                    if sim > DUPLICATE_VISUAL_THRESHOLD:
+            if dist < pos_threshold:
+                if anomaly['des'] is not None and new_des is not None:
+                    matches = self.bf.match(anomaly['des'], new_des)
+                    if len(matches) >= match_threshold:
                         return True
         return False
 
-    def feature_similarity(self, des1, des2):
-        if des1 is None or des2 is None:
-            return 0.0
-        matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-        matches = matcher.match(des1, des2)
-        if not matches:
-            return 0.0
-        distances = [m.distance for m in matches]
-        return 1.0 - (np.mean(distances) / 256.0)
-
-    def process_directory(self, image_dir):
-        for file in os.listdir(image_dir):
-            if file.endswith(('.jpg', '.png')):
-                path = os.path.join(image_dir, file)
-                x, y = self.extract_data_from_filename(file)
-                z = self.calculate_absolute_z(path)
-                desc = self.compute_visual_descriptor(path)
-
-                if not self.is_duplicate(x, y, z, desc):
-                    self.declared_anomalies.append((file, x, y, z, desc))
-                    self.get_logger().info(f"New anomaly: {file} at X:{x:.2f} Y:{y:.2f} Z:{z:.2f}")
-
 def main(args=None):
     rclpy.init(args=args)
-    node = HybridAnomalyDeduplicator()
+    node = AnomalyDeduplicator()
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
