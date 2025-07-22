@@ -27,7 +27,7 @@ anomaly_deduplicator/
 
 **Image filenames should be in this format:**
 ```
-image_x=<xcoord>_y=<ycoord>.jpg
+image_x=<xcoord>_y=<ycoord>_.jpg
 ```
 
 Example:
