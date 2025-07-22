@@ -8,18 +8,18 @@ from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped  # SLAM pose message type
+from nav_msgs.msg import Odometry
 
 # Load depth model globally
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 processor = AutoImageProcessor.from_pretrained("LiheYoung/depth-anything-small-hf")
 model = AutoModelForDepthEstimation.from_pretrained("LiheYoung/depth-anything-small-hf").to(device)
-SCALE = 1.0  # Calibration-dependent
+SCALE = 1.0  # adjust based on calibration
 
 class AnomalyDeduplicator(Node):
     def __init__(self):
         super().__init__('anomaly_deduplicator')
-        self.image_dir = '/path/to/anomaly/images'  # ✅ SET THIS
+        self.image_dir = '/path/to/anomaly/images'  # 🔁 Set your folder path
         self.output_dir = 'deduplicated_anomalies'
         os.makedirs(self.output_dir, exist_ok=True)
 
@@ -28,25 +28,25 @@ class AnomalyDeduplicator(Node):
         self.declared_anomalies = []
         self.seen_files = set()
 
-        # Global pose from SLAM
-        self.current_pose = [0.0, 0.0, 0.0]  # x, y, z
+        # Robot's global pose (x, y, z) from odometry
+        self.current_pose = [0.0, 0.0, 0.0]
 
-        # Subscribe to SLAM pose topic
+        # Subscribe to odometry/filtered
         self.pose_sub = self.create_subscription(
-            PoseStamped,           # Change to PoseWithCovarianceStamped if needed
-            '/pose',          # ✅ SET THIS to your actual SLAM topic
-            self.pose_callback,
+            Odometry,
+            '/odometry/filtered',
+            self.odom_callback,
             10
         )
 
         # Check for new images every 2 seconds
         self.timer = self.create_timer(2.0, self.process_new_images)
 
-    def pose_callback(self, msg):
-        """Update robot's global pose from SLAM"""
-        self.current_pose[0] = msg.pose.position.x
-        self.current_pose[1] = msg.pose.position.y
-        self.current_pose[2] = msg.pose.position.z  # Often 0 for ground robot
+    def odom_callback(self, msg: Odometry):
+        """Update pose from /odometry/filtered"""
+        self.current_pose[0] = msg.pose.pose.position.x
+        self.current_pose[1] = msg.pose.pose.position.y
+        self.current_pose[2] = msg.pose.pose.position.z
 
     def process_new_images(self):
         for image_file in sorted(os.listdir(self.image_dir)):
@@ -59,11 +59,11 @@ class AnomalyDeduplicator(Node):
             full_path = os.path.join(self.image_dir, image_file)
 
             try:
-                # Local coordinates from filename
+                # Local offset from filename
                 rel_x, rel_y = self.extract_data_from_filename(image_file)
                 z = self.calculate_absolute_z(full_path)
 
-                # Convert to global using SLAM pose
+                # Convert to global coordinates
                 x = self.current_pose[0] + rel_x
                 y = self.current_pose[1] + rel_y
 
@@ -74,22 +74,13 @@ class AnomalyDeduplicator(Node):
                     self.get_logger().info(f"Duplicate anomaly at ({x:.2f}, {y:.2f}, {z:.2f})")
                     continue
 
-                self.declared_anomalies.append({
-                    'x': x, 'y': y, 'z': z, 'des': des
-                })
-
-                # Save image to output directory
-                output_path = os.path.join(self.output_dir, image_file)
-                cv2.imwrite(output_path, cv2.imread(full_path))
-
-                # Log it
-                self.get_logger().info(f"New anomaly saved: {output_path} at ({x:.2f}, {y:.2f}, {z:.2f})")
-
-                # Save JSON metadata
+                self.declared_anomalies.append({'x': x, 'y': y, 'z': z, 'des': des})
+                cv2.imwrite(os.path.join(self.output_dir, image_file), cv2.imread(full_path))
+                self.get_logger().info(f"New anomaly saved: {image_file} at ({x:.2f}, {y:.2f}, {z:.2f})")
                 self.save_metadata()
 
             except Exception as e:
-                self.get_logger().error(f"Failed to process {image_file}: {e}")
+                self.get_logger().error(f"Error processing {image_file}: {e}")
 
     def extract_data_from_filename(self, filename):
         base = os.path.basename(filename)
@@ -132,7 +123,8 @@ class AnomalyDeduplicator(Node):
 
     def save_metadata(self):
         metadata = [
-            {k: v for k, v in d.items() if k in ['x', 'y', 'z']} for d in self.declared_anomalies
+            {k: v for k, v in d.items() if k in ['x', 'y', 'z']}
+            for d in self.declared_anomalies
         ]
         with open(os.path.join(self.output_dir, "anomalies_metadata.json"), "w") as f:
             json.dump(metadata, f, indent=4)
