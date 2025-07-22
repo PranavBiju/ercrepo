@@ -6,7 +6,10 @@
   <description>TODO: Package description</description>
   <maintainer email="pranav@todo.todo">pranav</maintainer>
   <license>TODO: License declaration</license>
-
+<exec_depend>rclpy</exec_depend>
+<exec_depend>cv_bridge</exec_depend> <!-- if needed -->
+<exec_depend>sensor_msgs</exec_depend> <!-- if needed -->
+  
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>

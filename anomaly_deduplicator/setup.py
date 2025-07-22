@@ -20,7 +20,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'anomaly_deduplicator = anomaly_deduplicator.anomaly_deduplicator_node:main'
+           
+           'deduplicator_node = anomaly_deduplicator.anomaly_deduplicator_node:main',
         ],
     },
 )
