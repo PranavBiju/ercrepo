@@ -20,8 +20,8 @@ SCALE = 1.0  # adjust based on calibration
 class AnomalyDeduplicator(Node):
     def __init__(self):
         super().__init__('anomaly_deduplicator')
-        self.image_dir = '/path/to/anomaly/images'  # 🔁 Set your folder path
-        self.output_dir = 'deduplicated_anomalies'
+        self.image_dir = '/home/smartnihar/ros2_ws/src/anomaly_frames'  # 🔁 Set your folder path
+        self.output_dir = '/home/smartnihar/ros2_ws/src/anomaly_unique'
         os.makedirs(self.output_dir, exist_ok=True)
 
         self.orb = cv2.ORB_create(500)
@@ -56,10 +56,7 @@ class AnomalyDeduplicator(Node):
         for image_file in sorted(os.listdir(self.image_dir)):
             if not image_file.endswith(('.png', '.jpg', '.jpeg')):
                 continue
-            if image_file in self.seen_files:
-                continue
-
-            self.seen_files.add(image_file)
+            
             full_path = os.path.join(self.image_dir, image_file)
 
             try:
@@ -116,7 +113,7 @@ class AnomalyDeduplicator(Node):
         absolute_z = self.current_pose[2] + relative_z
         return absolute_z
 
-    def is_duplicate(self, new_des, x, y, z, pos_threshold=0.3, match_threshold=30):
+    def is_duplicate(self, new_des, x, y, z, pos_threshold=3000, match_threshold=30):
         for anomaly in self.declared_anomalies:
             dx = anomaly['x'] - x
             dy = anomaly['y'] - y
