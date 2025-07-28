@@ -52,11 +52,62 @@ class AnomalyDeduplicator(Node):
         _, _, yaw = tf_transformations.euler_from_quaternion(quat)
         self.current_yaw = yaw
 
+    # -------------------------------
+    # NEW: simple quality heuristic
+    # -------------------------------
+    def image_quality(self, gray, keypoints):
+        # variance of Laplacian = sharpness proxy; mix with number of keypoints
+        sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+        return 0.7 * sharpness + 0.3 * len(keypoints)
+
+    # -------------------------------------------------
+    # NEW: duplicate finder that returns the best index
+    # (keeps your original is_duplicate() unchanged)
+    # -------------------------------------------------
+    def find_duplicate_index(self, new_des, x, y, z, pos_threshold=3000, match_threshold=30):
+        """
+        Returns: (is_dup: bool, idx: int)
+        """
+        for i, anomaly in enumerate(self.declared_anomalies):
+            dx = anomaly['x'] - x
+            dy = anomaly['y'] - y
+            dz = anomaly['z'] - z
+            dist = np.sqrt(dx**2 + dy**2 + dz**2)
+
+            if dist < pos_threshold:
+                if anomaly.get('des') is not None and new_des is not None:
+                    matches = self.bf.match(anomaly['des'], new_des)
+                    if len(matches) >= match_threshold:
+                        return True, i
+        return False, -1
+
+    # -------------------------------
+    # NEW: update existing anomaly
+    # -------------------------------
+    def update_anomaly(self, idx, x, y, z, des, quality, image_file, full_path):
+        # overwrite in-memory metadata
+        self.declared_anomalies[idx].update({
+            'x': x,
+            'y': y,
+            'z': z,
+            'des': des,
+            'quality': quality,
+            'filename': image_file
+        })
+        # overwrite the saved image on disk with the better one
+        dst_path = os.path.join(self.output_dir, image_file)
+        cv2.imwrite(dst_path, cv2.imread(full_path))
+        self.get_logger().info(
+            f"Replaced representative for anomaly #{idx} with higher-quality image: {image_file}"
+        )
+        # (optional) you can re-save metadata here if you want every replacement to flush to disk
+        self.save_metadata()
+
     def process_new_images(self):
         for image_file in sorted(os.listdir(self.image_dir)):
             if not image_file.endswith(('.png', '.jpg', '.jpeg')):
                 continue
-            
+
             full_path = os.path.join(self.image_dir, image_file)
 
             try:
@@ -76,11 +127,31 @@ class AnomalyDeduplicator(Node):
                 image = cv2.imread(full_path, cv2.IMREAD_GRAYSCALE)
                 kp, des = self.orb.detectAndCompute(image, None)
 
-                if self.is_duplicate(des, x, y, z):
-                    self.get_logger().info(f"Duplicate anomaly at ({x:.2f}, {y:.2f}, {z:.2f})")
+                # NEW: compute quality
+                quality = self.image_quality(image, kp)
+
+                # NEW: use the duplicate finder with index
+                is_dup, idx = self.find_duplicate_index(des, x, y, z)
+
+                if is_dup:
+                    # if the new image is better, replace the stored one
+                    if quality > self.declared_anomalies[idx].get('quality', -1e9):
+                        self.update_anomaly(idx, x, y, z, des, quality, image_file, full_path)
+                    else:
+                        self.get_logger().info(
+                            f"Duplicate (lower quality) discarded: {image_file} at ({x:.2f}, {y:.2f}, {z:.2f})"
+                        )
                     continue
 
-                self.declared_anomalies.append({'x': x, 'y': y, 'z': z, 'des': des})
+                # Not a duplicate → store as a fresh anomaly
+                self.declared_anomalies.append({
+                    'x': x,
+                    'y': y,
+                    'z': z,
+                    'des': des,
+                    'quality': quality,
+                    'filename': image_file
+                })
                 cv2.imwrite(os.path.join(self.output_dir, image_file), cv2.imread(full_path))
                 self.get_logger().info(f"New anomaly saved: {image_file} at ({x:.2f}, {y:.2f}, {z:.2f})")
                 self.save_metadata()
@@ -114,6 +185,7 @@ class AnomalyDeduplicator(Node):
         return absolute_z
 
     def is_duplicate(self, new_des, x, y, z, pos_threshold=3000, match_threshold=30):
+        # <-- kept exactly as you had it
         for anomaly in self.declared_anomalies:
             dx = anomaly['x'] - x
             dy = anomaly['y'] - y
