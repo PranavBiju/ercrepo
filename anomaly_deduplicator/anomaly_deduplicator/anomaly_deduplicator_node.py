@@ -9,18 +9,17 @@ from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
-import tf_transformations  # for quaternion to euler conversion
+import tf_transformations
 
-# Load depth model globally
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 processor = AutoImageProcessor.from_pretrained("LiheYoung/depth-anything-small-hf")
 model = AutoModelForDepthEstimation.from_pretrained("LiheYoung/depth-anything-small-hf").to(device)
-SCALE = 1.0  # adjust based on calibration
+SCALE = 1.0
 
 class AnomalyDeduplicator(Node):
     def __init__(self):
         super().__init__('anomaly_deduplicator')
-        self.image_dir = '/home/smartnihar/ros2_ws/src/anomaly_frames'  # 🔁 Set your folder path
+        self.image_dir = '/home/smartnihar/ros2_ws/src/anomaly_frames'
         self.output_dir = '/home/smartnihar/ros2_ws/src/anomaly_unique'
         os.makedirs(self.output_dir, exist_ok=True)
 
@@ -29,7 +28,6 @@ class AnomalyDeduplicator(Node):
         self.declared_anomalies = []
         self.seen_files = set()
 
-        # Robot's global pose and orientation
         self.current_pose = [0.0, 0.0, 0.0]
         self.current_yaw = 0.0
 
@@ -62,7 +60,6 @@ class AnomalyDeduplicator(Node):
             dy = anomaly['y'] - y
             dz = anomaly['z'] - z
             dist = np.sqrt(dx**2 + dy**2 + dz**2)
-
             if dist < pos_threshold:
                 if anomaly.get('des') is not None and new_des is not None:
                     matches = self.bf.match(anomaly['des'], new_des)
@@ -70,22 +67,21 @@ class AnomalyDeduplicator(Node):
                         return True, i
         return False, -1
 
-    def update_anomaly(self, idx, x, y, z, des, quality, image_file, full_path):
-        # ✅ Overwrite in-memory metadata
+    def update_anomaly(self, idx, x, y, z, des, quality, area, idno, image_file, full_path):
         self.declared_anomalies[idx].update({
             'x': x,
             'y': y,
             'z': z,
             'des': des,
             'quality': quality,
+            'area': area,
+            'idno': idno,
+            'filename': image_file
         })
-
-        # ✅ Overwrite the actual saved image on disk using old filename
-        old_path = os.path.join(self.output_dir, self.declared_anomalies[idx]['filename'])
-        cv2.imwrite(old_path, cv2.imread(full_path))
-
+        dst_path = os.path.join(self.output_dir, image_file)
+        cv2.imwrite(dst_path, cv2.imread(full_path))
         self.get_logger().info(
-            f"Replaced representative for anomaly #{idx} with higher-quality image: {self.declared_anomalies[idx]['filename']}"
+            f"Replaced representative for anomaly #{idx} with higher-quality, larger-area image: {image_file}"
         )
         self.save_metadata()
 
@@ -97,7 +93,7 @@ class AnomalyDeduplicator(Node):
             full_path = os.path.join(self.image_dir, image_file)
 
             try:
-                rel_x, rel_y = self.extract_data_from_filename(image_file)
+                idno, area, rel_x, rel_y = self.extract_data_from_filename(image_file)
                 z = self.calculate_absolute_z(full_path)
 
                 cos_yaw = np.cos(self.current_yaw)
@@ -115,11 +111,13 @@ class AnomalyDeduplicator(Node):
                 is_dup, idx = self.find_duplicate_index(des, x, y, z)
 
                 if is_dup:
-                    if quality > self.declared_anomalies[idx].get('quality', -1e9):
-                        self.update_anomaly(idx, x, y, z, des, quality, image_file, full_path)
+                    prev_area = self.declared_anomalies[idx].get('area', 0)
+                    if area > prev_area:
+                        self.delete_nearby_idnos(idno)
+                        self.update_anomaly(idx, x, y, z, des, quality, area, idno, image_file, full_path)
                     else:
                         self.get_logger().info(
-                            f"Duplicate (lower quality) discarded: {image_file} at ({x:.2f}, {y:.2f}, {z:.2f})"
+                            f"Duplicate (lower quality/area) discarded: {image_file} at ({x:.2f}, {y:.2f}, {z:.2f})"
                         )
                     continue
 
@@ -129,6 +127,8 @@ class AnomalyDeduplicator(Node):
                     'z': z,
                     'des': des,
                     'quality': quality,
+                    'area': area,
+                    'idno': idno,
                     'filename': image_file
                 })
                 cv2.imwrite(os.path.join(self.output_dir, image_file), cv2.imread(full_path))
@@ -138,16 +138,30 @@ class AnomalyDeduplicator(Node):
             except Exception as e:
                 self.get_logger().error(f"Error processing {image_file}: {e}")
 
+    def delete_nearby_idnos(self, idno, delta=10):
+        files = os.listdir(self.output_dir)
+        for fname in files:
+            if not fname.endswith(('.png', '.jpg', '.jpeg')):
+                continue
+            try:
+                fid = int(fname.split("_")[0])
+                if abs(fid - idno) <= delta:
+                    os.remove(os.path.join(self.output_dir, fname))
+                    self.get_logger().info(f"Deleted old nearby image due to better anomaly: {fname}")
+            except Exception as e:
+                self.get_logger().warning(f"Could not parse ID from filename {fname}: {e}")
+
     def extract_data_from_filename(self, filename):
         base = os.path.basename(filename)
+        idno = int(base.split("_")[0])
+        area = float(base.split("a=")[1].split("_")[0])
         x = float(base.split("x=")[1].split("_")[0])
         y = float(base.split("y=")[1].split("_")[0])
-        return x, y
+        return idno, area, x, y
 
     def calculate_absolute_z(self, image_path):
         image = PILImage.open(image_path).convert("RGB")
         inputs = processor(images=image, return_tensors="pt").to(device)
-
         with torch.no_grad():
             outputs = model(**inputs)
             predicted_depth = outputs.predicted_depth
@@ -157,7 +171,6 @@ class AnomalyDeduplicator(Node):
                 mode="bicubic",
                 align_corners=False
             ).squeeze()
-
         depth_map = prediction.cpu().numpy()
         relative_z = float(np.median(depth_map)) * SCALE
         absolute_z = self.current_pose[2] + relative_z
@@ -169,7 +182,6 @@ class AnomalyDeduplicator(Node):
             dy = anomaly['y'] - y
             dz = anomaly['z'] - z
             dist = np.sqrt(dx**2 + dy**2 + dz**2)
-
             if dist < pos_threshold:
                 if anomaly['des'] is not None and new_des is not None:
                     matches = self.bf.match(anomaly['des'], new_des)
@@ -179,7 +191,7 @@ class AnomalyDeduplicator(Node):
 
     def save_metadata(self):
         metadata = [
-            {k: v for k, v in d.items() if k in ['x', 'y', 'z']}
+            {k: v for k, v in d.items() if k in ['x', 'y', 'z', 'area', 'idno']}
             for d in self.declared_anomalies
         ]
         with open(os.path.join(self.output_dir, "anomalies_metadata.json"), "w") as f:
