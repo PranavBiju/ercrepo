@@ -70,26 +70,24 @@ class AnomalyDeduplicator(Node):
                         return True, i
         return False, -1
 
-    def update_anomaly(self, idx, x, y, z, des, quality, image_file, full_path, area):
+    def update_anomaly(self, idx, x, y, z, des, quality, image_file, full_path):
+        # ✅ Overwrite in-memory metadata
         self.declared_anomalies[idx].update({
             'x': x,
             'y': y,
             'z': z,
             'des': des,
             'quality': quality,
-            'filename': image_file,
-            'area': area
         })
-        dst_path = os.path.join(self.output_dir, image_file)
-        cv2.imwrite(dst_path, cv2.imread(full_path))
+
+        # ✅ Overwrite the actual saved image on disk using old filename
+        old_path = os.path.join(self.output_dir, self.declared_anomalies[idx]['filename'])
+        cv2.imwrite(old_path, cv2.imread(full_path))
+
         self.get_logger().info(
-            f"Replaced representative for anomaly #{idx} with higher-quality image: {image_file}"
+            f"Replaced representative for anomaly #{idx} with higher-quality image: {self.declared_anomalies[idx]['filename']}"
         )
         self.save_metadata()
-
-    def max_area_in_last_n(self, n=10):
-        recent = self.declared_anomalies[-n:]
-        return max((an['area'] for an in recent), default=0.0)
 
     def process_new_images(self):
         for image_file in sorted(os.listdir(self.image_dir)):
@@ -99,7 +97,7 @@ class AnomalyDeduplicator(Node):
             full_path = os.path.join(self.image_dir, image_file)
 
             try:
-                area, rel_x, rel_y = self.extract_data_from_filename(image_file)
+                rel_x, rel_y = self.extract_data_from_filename(image_file)
                 z = self.calculate_absolute_z(full_path)
 
                 cos_yaw = np.cos(self.current_yaw)
@@ -112,24 +110,17 @@ class AnomalyDeduplicator(Node):
 
                 image = cv2.imread(full_path, cv2.IMREAD_GRAYSCALE)
                 kp, des = self.orb.detectAndCompute(image, None)
-
                 quality = self.image_quality(image, kp)
+
                 is_dup, idx = self.find_duplicate_index(des, x, y, z)
 
                 if is_dup:
                     if quality > self.declared_anomalies[idx].get('quality', -1e9):
-                        self.update_anomaly(idx, x, y, z, des, quality, image_file, full_path, area)
+                        self.update_anomaly(idx, x, y, z, des, quality, image_file, full_path)
                     else:
                         self.get_logger().info(
                             f"Duplicate (lower quality) discarded: {image_file} at ({x:.2f}, {y:.2f}, {z:.2f})"
                         )
-                    continue
-
-                # ✅ New area-based check
-                if area < self.max_area_in_last_n(n=10):
-                    self.get_logger().info(
-                        f"Area {area:.2f} is too small compared to recent images. Skipping: {image_file}"
-                    )
                     continue
 
                 self.declared_anomalies.append({
@@ -138,8 +129,7 @@ class AnomalyDeduplicator(Node):
                     'z': z,
                     'des': des,
                     'quality': quality,
-                    'filename': image_file,
-                    'area': area
+                    'filename': image_file
                 })
                 cv2.imwrite(os.path.join(self.output_dir, image_file), cv2.imread(full_path))
                 self.get_logger().info(f"New anomaly saved: {image_file} at ({x:.2f}, {y:.2f}, {z:.2f})")
@@ -150,10 +140,9 @@ class AnomalyDeduplicator(Node):
 
     def extract_data_from_filename(self, filename):
         base = os.path.basename(filename)
-        a = float(base.split("a=")[1].split("_")[0])
         x = float(base.split("x=")[1].split("_")[0])
         y = float(base.split("y=")[1].split("_")[0])
-        return a, x, y
+        return x, y
 
     def calculate_absolute_z(self, image_path):
         image = PILImage.open(image_path).convert("RGB")
@@ -190,7 +179,7 @@ class AnomalyDeduplicator(Node):
 
     def save_metadata(self):
         metadata = [
-            {k: v for k, v in d.items() if k in ['x', 'y', 'z', 'area']}
+            {k: v for k, v in d.items() if k in ['x', 'y', 'z']}
             for d in self.declared_anomalies
         ]
         with open(os.path.join(self.output_dir, "anomalies_metadata.json"), "w") as f:
